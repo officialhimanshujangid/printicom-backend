@@ -56,22 +56,23 @@ const authLimiter = rateLimit({
 app.use(helmet({
   crossOriginResourcePolicy: { policy: "cross-origin" }
 }));
-app.use(cors({
-  origin: (origin, callback) => {
-    const allowed = [
-      process.env.CLIENT_URL || 'http://localhost:3000',
-      process.env.CLIENT_URL || 'http://localhost:4000',
-      process.env.ADMIN_URL || 'http://localhost:4000',
-      process.env.ADMIN_URL || 'http://localhost:5173',
-      process.env.ADMIN_URL || 'http://localhost:5174',
-    ];
-    if (!origin || allowed.includes(origin)) return callback(null, true);
-    return callback(new Error('CORS: origin not allowed'));
-  },
-  credentials: true,
-  methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
-  allowedHeaders: ['Content-Type', 'Authorization'],
-}));
+// app.use(cors({
+//   origin: (origin, callback) => {
+//     const allowed = [
+//       process.env.CLIENT_URL || 'http://localhost:3000',
+//       process.env.CLIENT_URL || 'http://localhost:4000',
+//       process.env.ADMIN_URL || 'http://localhost:4000',
+//       process.env.ADMIN_URL || 'http://localhost:5173',
+//       process.env.ADMIN_URL || 'http://localhost:5174',
+//     ];
+//     if (!origin || allowed.includes(origin)) return callback(null, true);
+//     return callback(new Error('CORS: origin not allowed'));
+//   },
+//   credentials: true,
+//   methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
+//   allowedHeaders: ['Content-Type', 'Authorization'],
+// }));
+app.use(cors());
 app.use(globalLimiter);
 app.use(morgan(process.env.NODE_ENV === 'development' ? 'dev' : 'combined'));
 app.use(express.json({ limit: '10mb' }));
