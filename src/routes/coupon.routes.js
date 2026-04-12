@@ -18,6 +18,7 @@ const couponCreateRules = [
 router.use(protect, requireEmailVerified);
 
 router.post('/validate', couponController.validateCoupon);
+router.get('/eligible', couponController.getEligibleCoupons);
 
 router.use(authorize('admin'));
 router.post('/targeted-campaign', couponController.createTargetedCampaign);

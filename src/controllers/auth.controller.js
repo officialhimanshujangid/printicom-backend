@@ -4,6 +4,7 @@ const { generateAccessToken, generateRefreshToken, verifyRefreshToken } = requir
 const { successResponse, errorResponse } = require('../utils/response.utils');
 const sendEmail = require('../config/email');
 const { emailVerificationTemplate, passwordResetTemplate, welcomeTemplate } = require('../utils/emailTemplates');
+const { logActivity } = require('./auditLog.controller');
 
 // ─── Register (Client only) ────────────────────────────────
 exports.register = async (req, res) => {
@@ -132,6 +133,8 @@ exports.login = async (req, res) => {
     user.refreshToken = refreshToken;
     user.lastLogin = new Date();
     await user.save({ validateBeforeSave: false });
+
+    await logActivity(user._id, 'User Login', 'Auth', user._id, 'User authenticated successfully', req.ip);
 
     return successResponse(res, 200, 'Login successful', {
       accessToken,
@@ -269,6 +272,8 @@ exports.updateProfile = async (req, res) => {
       new: true,
       runValidators: true,
     });
+
+    await logActivity(req.user._id, 'Profile Updated', 'User', user._id, 'User updated their profile information', req.ip);
 
     return successResponse(res, 200, 'Profile updated successfully', { user });
   } catch (error) {

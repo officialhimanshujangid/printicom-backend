@@ -33,6 +33,15 @@ const siteSettingsSchema = new mongoose.Schema(
       codMaxOrderAmount: { type: Number, default: 5000 }, // COD allowed up to ₹5000
     },
 
+    // ── Third-Party Shipping API ───────────────────────────
+    shiprocket: {
+      enabled: { type: Boolean, default: false },
+      email: { type: String, default: null },
+      password: { type: String, default: null },
+      token: { type: String, default: null },           // Cached API token
+      tokenExpiresAt: { type: Date, default: null },    // Token expiry (cache invalidation)
+    },
+
     // ── Tax ────────────────────────────────────────────────
     tax: {
       enabled: { type: Boolean, default: false },
@@ -40,6 +49,26 @@ const siteSettingsSchema = new mongoose.Schema(
       gstNumber: { type: String, default: null },
       includedInPrice: { type: Boolean, default: true }, // if false, added at checkout
     },
+
+    // ── Theme Colors ───────────────────────────────────────
+    // All CSS variables controllable from Admin → Settings → Homepage/Theme
+    theme: {
+      primary:        { type: String, default: '#FF6B35' },
+      primaryLight:   { type: String, default: '#FF8C5A' },
+      primaryDark:    { type: String, default: '#E05520' },
+      accent:         { type: String, default: '#FFB347' },
+      accentLight:    { type: String, default: '#FFC875' },
+      bgBase:         { type: String, default: '#09090F' },
+      bgSurface:      { type: String, default: '#111118' },
+      bgElevated:     { type: String, default: '#18181F' },
+      textPrimary:    { type: String, default: '#F2F2F7' },
+      textSecondary:  { type: String, default: 'rgba(242,242,247,0.7)' },
+      textMuted:      { type: String, default: 'rgba(242,242,247,0.4)' },
+      borderColor:    { type: String, default: 'rgba(255,255,255,0.08)' },
+      borderFocus:    { type: String, default: 'rgba(255,107,53,0.5)' },
+    },
+    // When theme was last changed — used by client to detect staleness
+    themeUpdatedAt: { type: Date, default: null },
 
     // ── Homepage Config ────────────────────────────────────
     homepage: {
@@ -86,11 +115,17 @@ const siteSettingsSchema = new mongoose.Schema(
       pinterest: { type: String, default: null },
     },
 
-    // ── SEO ────────────────────────────────────────────────
+    // ── SEO ────────────────────────────────────────────────────────
     seo: {
-      metaTitle: { type: String, default: 'Printicom – Custom Photo Printing & Personalized Gifts' },
+      metaTitle:       { type: String, default: 'Printicom – Custom Photo Printing & Personalized Gifts' },
       metaDescription: { type: String, default: 'Print your memories on mugs, calendars, photo prints & more. Best custom gifting store in India.' },
-      metaKeywords: { type: String, default: 'custom mugs, photo prints, personalized gifts, photo calendar, canvas print' },
+      metaKeywords:    { type: String, default: 'custom mugs, photo prints, personalized gifts, photo calendar, canvas print' },
+      ogTitle:         { type: String, default: '' },
+      ogDescription:   { type: String, default: '' },
+      ogImage:         { type: String, default: '' },        // URL to OG image
+      twitterCard:     { type: String, default: 'summary_large_image', enum: ['summary', 'summary_large_image', 'app', 'player'] },
+      robots:          { type: String, default: 'index, follow' }, // e.g. 'noindex, nofollow'
+      canonicalUrl:    { type: String, default: '' },
     },
 
     // ── Order Settings ─────────────────────────────────────
@@ -106,6 +141,35 @@ const siteSettingsSchema = new mongoose.Schema(
     maintenanceMode: {
       enabled: { type: Boolean, default: false },
       message: { type: String, default: 'We are currently upgrading our systems. Back soon!' },
+    },
+
+    // ── Reports Visibility ──────────────────────────────────
+    reports: {
+      ordersReport:   { type: Boolean, default: true },
+      gstReport:      { type: Boolean, default: true },
+      productsReport: { type: Boolean, default: true },
+      customersReport:{ type: Boolean, default: true },
+      stockReport:    { type: Boolean, default: true },
+      couponsReport:  { type: Boolean, default: true },
+      invoicesReport: { type: Boolean, default: true },
+    },
+
+    // ── Invoice Module ─────────────────────────────────────
+    invoice: {
+      enabled:              { type: Boolean, default: false },
+      invoicePrefix:        { type: String,  default: 'INV' },
+      businessState:        { type: String,  default: '' },  // e.g. 'Rajasthan' — for GST logic
+      defaultDueDays:       { type: Number,  default: 15 },
+      defaultTerms:         { type: String,  default: 'Payment is due within 15 days of invoice date.' },
+      cancellationPolicy:   { type: String,  default: '' },
+      allowCancellation:    { type: Boolean, default: true },
+      allowRevoke:          { type: Boolean, default: true },
+      emailOnCreate:        { type: Boolean, default: false },
+      sendWhatsApp:         { type: Boolean, default: false },
+      whatsAppApiKey:       { type: String,  default: '' },  // Meta Cloud API Bearer Token
+      whatsAppPhoneNumberId:{ type: String,  default: '' },  // Meta Phone Number ID
+      // Auto-deduct stock when invoice linked to product item
+      autoDeductStock:      { type: Boolean, default: false },
     },
 
     updatedBy: {

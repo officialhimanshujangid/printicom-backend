@@ -104,6 +104,10 @@ const productSchema = new mongoose.Schema(
     pricingTiers: [pricingTierSchema],
     isCustomizable: { type: Boolean, default: false },
     customizationOptions: [customizationFieldSchema],
+    // ─── GST ─────────────────────────────────────────────
+    isGstApplicable: { type: Boolean, default: false },
+    gstPercentage: { type: Number, default: null }, // null = use global setting rate
+    gstIncludedInPrice: { type: String, enum: ['global', 'yes', 'no'], default: 'global' }, // product level override
     // Occasions / themes this product is related to (with per-occasion images)
     relatedTos: [relatedToEntrySchema],
     tags: [String],

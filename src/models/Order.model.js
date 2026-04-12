@@ -30,6 +30,10 @@ const orderItemSchema = new mongoose.Schema({
     required: true,
     min: 0,
   },
+  // GST breakdown (stored at time of order for accurate reporting)
+  baseUnitPrice: { type: Number, default: null },  // price before GST (null if GST not applicable)
+  gstRate:       { type: Number, default: 0 },      // % applied (0 = not applicable)
+  gstAmount:     { type: Number, default: 0 },      // total GST for this line (rate * qty)
   lineTotal: {
     type: Number,
     required: true,
@@ -57,10 +61,11 @@ const orderSchema = new mongoose.Schema(
     items: [orderItemSchema],
 
     // ── Pricing ────────────────────────────────────────────
-    subtotal: { type: Number, required: true, min: 0 },
+    subtotal:       { type: Number, required: true, min: 0 }, // sum of line totals (incl. GST if GST-inclusive)
     shippingCharge: { type: Number, default: 0, min: 0 },
     couponDiscount: { type: Number, default: 0, min: 0 },
-    totalAmount: { type: Number, required: true, min: 0 },
+    gstTotal:       { type: Number, default: 0, min: 0 },     // total GST collected on this order
+    totalAmount:    { type: Number, required: true, min: 0 }, // final amount charged to customer
 
     // ── Shipping Address (snapshot) ──────────────────────
     shippingAddress: {
@@ -126,12 +131,20 @@ const orderSchema = new mongoose.Schema(
       paidAt: Date,
     },
 
+    // ── Internal Flags ─────────────────────────────────────
+    stockDeducted: { type: Boolean, default: false },
+    invoiceProcessed: { type: Boolean, default: false },
+
     // ── Delivery / Tracking ───────────────────────────────
     estimatedDeliveryDate: Date,
     deliveredAt: Date,
     trackingNumber: String,
     trackingUrl: String,
     courierName: String,
+    shipmentId: String,          // APi Shipment ID
+    labelUrl: String,            // Shipping label PDF url
+    isManualShipped: { type: Boolean, default: null }, // true if manually processed, false if API
+
 
     // ── Cancellation Management ──────────────────────────────────────
     cancellationRequest: {

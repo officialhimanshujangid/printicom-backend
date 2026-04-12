@@ -1,6 +1,7 @@
 const SiteSettings = require('../models/SiteSettings.model');
 const { successResponse, errorResponse } = require('../utils/response.utils');
 const { upload } = require('../utils/upload.utils');
+const { logActivity } = require('./auditLog.controller');
 
 // ─── Get or Initialise Settings ────────────────────────
 const getOrInit = async () => {
@@ -27,6 +28,9 @@ exports.getPublicSettings = async (req, res) => {
       socialLinks: settings.socialLinks,
       seo: settings.seo,
       homepage: settings.homepage,
+      theme: settings.theme,
+      themeUpdatedAt: settings.themeUpdatedAt,
+      updatedAt: settings.updatedAt,
       shipping: {
         freeShippingThreshold: settings.shipping.freeShippingThreshold,
         standardShippingCharge: settings.shipping.standardShippingCharge,
@@ -59,7 +63,12 @@ exports.getPublicSettings = async (req, res) => {
 exports.getFullSettings = async (req, res) => {
   try {
     const settings = await getOrInit();
-    return successResponse(res, 200, 'Full site settings', { settings });
+    const s = settings.toObject();
+    // Mask sensitive passwords from API responses even for admins
+    if (s.shiprocket && s.shiprocket.password) {
+      s.shiprocket.password = '••••••••';
+    }
+    return successResponse(res, 200, 'Full site settings', { settings: s });
   } catch (error) {
     return errorResponse(res, 500, error.message);
   }
@@ -88,6 +97,8 @@ exports.updateGeneral = async (req, res) => {
     settings.updatedBy = req.user._id;
     await settings.save();
 
+    await logActivity(req.user._id, 'Settings Updated', 'Settings', settings._id, 'Updated General site settings (name, tagline, contact)', req.ip);
+
     return successResponse(res, 200, 'General settings updated', { settings });
   } catch (error) {
     return errorResponse(res, 500, error.message);
@@ -105,6 +116,14 @@ exports.updatePaymentMethods = async (req, res) => {
         settings.paymentMethods.cod.enabled =
           paymentMethods.cod.enabled === true || paymentMethods.cod.enabled === 'true';
         if (paymentMethods.cod.label) settings.paymentMethods.cod.label = paymentMethods.cod.label;
+        
+        // Map COD specific charges to shipping sub-object
+        if (paymentMethods.cod.extraCharge !== undefined) {
+          settings.shipping.codExtraCharge = parseFloat(paymentMethods.cod.extraCharge) || 0;
+        }
+        if (paymentMethods.cod.maxOrderAmount !== undefined) {
+          settings.shipping.codMaxOrderAmount = parseFloat(paymentMethods.cod.maxOrderAmount) || 0;
+        }
       }
       if (paymentMethods.razorpay !== undefined) {
         settings.paymentMethods.razorpay.enabled =
@@ -124,6 +143,8 @@ exports.updatePaymentMethods = async (req, res) => {
     settings.markModified('paymentMethods');
     await settings.save();
 
+    await logActivity(req.user._id, 'Settings Updated', 'Settings', settings._id, 'Updated Payment Methods configuration', req.ip);
+
     return successResponse(res, 200, 'Payment methods updated', {
       paymentMethods: settings.paymentMethods,
     });
@@ -139,21 +160,38 @@ exports.updateShipping = async (req, res) => {
     const { shipping } = req.body;
 
     if (shipping) {
-      Object.keys(shipping).forEach((key) => {
-        if (settings.shipping[key] !== undefined) {
-          settings.shipping[key] =
-            typeof settings.shipping[key] === 'boolean'
-              ? shipping[key] === true || shipping[key] === 'true'
-              : parseFloat(shipping[key]) || settings.shipping[key];
-        }
-      });
+      if (shipping.freeShippingThreshold !== undefined) settings.set('shipping.freeShippingThreshold', parseFloat(shipping.freeShippingThreshold) || 0);
+      if (shipping.standardShippingCharge !== undefined) settings.set('shipping.standardShippingCharge', parseFloat(shipping.standardShippingCharge) || 0);
+      if (shipping.expressShippingCharge !== undefined) settings.set('shipping.expressShippingCharge', parseFloat(shipping.expressShippingCharge) || 0);
+      if (shipping.expressShippingEnabled !== undefined) settings.set('shipping.expressShippingEnabled', shipping.expressShippingEnabled === true || shipping.expressShippingEnabled === 'true');
+      if (shipping.codExtraCharge !== undefined) settings.set('shipping.codExtraCharge', parseFloat(shipping.codExtraCharge) || 0);
+      if (shipping.codMaxOrderAmount !== undefined) settings.set('shipping.codMaxOrderAmount', parseFloat(shipping.codMaxOrderAmount) || 0);
+    }
+    
+    const { shiprocket } = req.body;
+    if (shiprocket) {
+      // Create a fresh clone of the subdocument to break Proxy cache memory loops
+      const sr = settings.shiprocket ? { ...settings.shiprocket } : {};
+      
+      if (shiprocket.enabled !== undefined) sr.enabled = shiprocket.enabled === true || shiprocket.enabled === 'true';
+      if (shiprocket.email !== undefined) sr.email = shiprocket.email;
+      if (shiprocket.password && shiprocket.password !== '••••••••') {
+        sr.password = shiprocket.password;
+      }
+      
+      // Reassign to document object natively
+      settings.shiprocket = sr;
     }
 
     settings.updatedBy = req.user._id;
     settings.markModified('shipping');
+    settings.markModified('shiprocket');
     await settings.save();
 
-    return successResponse(res, 200, 'Shipping rules updated', { shipping: settings.shipping });
+    await logActivity(req.user._id, 'Settings Updated', 'Settings', settings._id, 'Updated Global Shipping rules', req.ip);
+
+    const refreshed = await getOrInit();
+    return successResponse(res, 200, 'Shipping rules updated', { shipping: refreshed.shipping, shiprocket: { enabled: refreshed.shiprocket?.enabled, email: refreshed.shiprocket?.email } });
   } catch (error) {
     return errorResponse(res, 500, error.message);
   }
@@ -177,27 +215,30 @@ exports.updateHomepage = async (req, res) => {
     settings.markModified('homepage');
     await settings.save();
 
-    return successResponse(res, 200, 'Homepage config updated', { homepage: settings.homepage });
+    await logActivity(req.user._id, 'Settings Updated', 'Settings', settings._id, 'Updated Homepage configuration', req.ip);
+
+    return successResponse(res, 200, 'Homepage settings updated', { homepage: settings.homepage });
   } catch (error) {
     return errorResponse(res, 500, error.message);
   }
 };
 
-// ─── ADMIN: Update SEO ─────────────────────────────────
+// ─── ADMIN: Update SEO ──────────────────────────────────────────────────────
 exports.updateSEO = async (req, res) => {
   try {
     const settings = await getOrInit();
     const { seo } = req.body;
 
     if (seo) {
-      if (seo.metaTitle) settings.seo.metaTitle = seo.metaTitle;
-      if (seo.metaDescription) settings.seo.metaDescription = seo.metaDescription;
-      if (seo.metaKeywords) settings.seo.metaKeywords = seo.metaKeywords;
+      const fields = ['metaTitle','metaDescription','metaKeywords','ogTitle','ogDescription','ogImage','twitterCard','robots','canonicalUrl'];
+      fields.forEach(f => { if (seo[f] !== undefined) settings.seo[f] = seo[f]; });
     }
 
     settings.updatedBy = req.user._id;
     settings.markModified('seo');
     await settings.save();
+
+    await logActivity(req.user._id, 'Settings Updated', 'Settings', settings._id, 'Updated SEO Meta settings', req.ip);
 
     return successResponse(res, 200, 'SEO settings updated', { seo: settings.seo });
   } catch (error) {
@@ -221,6 +262,8 @@ exports.updateSocialLinks = async (req, res) => {
     settings.markModified('socialLinks');
     await settings.save();
 
+    await logActivity(req.user._id, 'Settings Updated', 'Settings', settings._id, 'Updated Social Media links', req.ip);
+
     return successResponse(res, 200, 'Social links updated', { socialLinks: settings.socialLinks });
   } catch (error) {
     return errorResponse(res, 500, error.message);
@@ -243,6 +286,8 @@ exports.toggleMaintenance = async (req, res) => {
     settings.markModified('maintenanceMode');
     await settings.save();
 
+    await logActivity(req.user._id, 'Settings Updated', 'Settings', settings._id, `Maintenance Mode ${settings.maintenanceMode.enabled ? 'Enabled' : 'Disabled'}`, req.ip);
+
     return successResponse(
       res,
       200,
@@ -263,7 +308,10 @@ exports.updateTax = async (req, res) => {
     if (tax) {
       if (tax.enabled !== undefined)
         settings.tax.enabled = tax.enabled === true || tax.enabled === 'true';
-      if (tax.gstPercentage !== undefined) settings.tax.gstPercentage = parseFloat(tax.gstPercentage);
+      if (tax.gstPercentage !== undefined) {
+        const val = parseFloat(tax.gstPercentage);
+        settings.tax.gstPercentage = !isNaN(val) ? val : settings.tax.gstPercentage;
+      }
       if (tax.gstNumber !== undefined) settings.tax.gstNumber = tax.gstNumber || null;
       if (tax.includedInPrice !== undefined)
         settings.tax.includedInPrice = tax.includedInPrice === true || tax.includedInPrice === 'true';
@@ -272,6 +320,8 @@ exports.updateTax = async (req, res) => {
     settings.updatedBy = req.user._id;
     settings.markModified('tax');
     await settings.save();
+
+    await logActivity(req.user._id, 'Settings Updated', 'Settings', settings._id, 'Updated Tax & GST configuration', req.ip);
 
     return successResponse(res, 200, 'Tax settings updated', { tax: settings.tax });
   } catch (error) {
@@ -291,7 +341,8 @@ exports.updateOrderSettings = async (req, res) => {
           settings.orderSettings[key] =
             orderSettings[key] === true || orderSettings[key] === 'true';
         } else {
-          settings.orderSettings[key] = parseFloat(orderSettings[key]) || settings.orderSettings[key];
+          const val = parseFloat(orderSettings[key]);
+          settings.orderSettings[key] = !isNaN(val) ? val : settings.orderSettings[key];
         }
       });
     }
@@ -300,7 +351,113 @@ exports.updateOrderSettings = async (req, res) => {
     settings.markModified('orderSettings');
     await settings.save();
 
-    return successResponse(res, 200, 'Order settings updated', { orderSettings: settings.orderSettings });
+    await logActivity(req.user._id, 'Settings Updated', 'Settings', settings._id, 'Updated Global Order flow settings', req.ip);
+
+    return successResponse(res, 200, 'Order settings updated', {
+      orderSettings: settings.orderSettings,
+    });
+  } catch (error) {
+    return errorResponse(res, 500, error.message);
+  }
+};
+
+// ─── ADMIN: Update Theme Colors ────────────────────────────
+exports.updateTheme = async (req, res) => {
+  try {
+    const settings = await getOrInit();
+    const { theme } = req.body;
+
+    if (theme) {
+      const allowed = [
+        'primary', 'primaryLight', 'primaryDark',
+        'accent', 'accentLight',
+        'bgBase', 'bgSurface', 'bgElevated',
+        'textPrimary', 'textSecondary', 'textMuted',
+        'borderColor', 'borderFocus',
+      ];
+
+      // Initialize theme sub-doc if it doesn't exist on old DB documents
+      if (!settings.theme) {
+        settings.theme = {
+          primary: '#FF6B35', primaryLight: '#FF8C5A', primaryDark: '#E05520',
+          accent: '#FFB347', accentLight: '#FFC875',
+          bgBase: '#09090F', bgSurface: '#111118', bgElevated: '#18181F',
+          textPrimary: '#F2F2F7', textSecondary: 'rgba(242,242,247,0.7)',
+          textMuted: 'rgba(242,242,247,0.4)', borderColor: 'rgba(255,255,255,0.08)',
+          borderFocus: 'rgba(255,107,53,0.5)',
+        };
+      }
+
+      allowed.forEach((key) => {
+        if (theme[key] !== undefined) settings.theme[key] = theme[key];
+      });
+    }
+
+    // Bump themeUpdatedAt so all clients know to reload theme
+    settings.themeUpdatedAt = new Date();
+    settings.updatedBy = req.user._id;
+    settings.themeUpdatedAt = new Date(); // important for client cache busting
+    settings.markModified('theme');
+    await settings.save();
+
+    await logActivity(req.user._id, 'Theme Updated', 'Settings', settings._id, 'Updated Client Site Branding Colors', req.ip);
+
+    return successResponse(res, 200, 'Theme updated successfully', {
+      theme: settings.theme,
+      themeUpdatedAt: settings.themeUpdatedAt,
+    });
+  } catch (error) {
+    return errorResponse(res, 500, error.message);
+  }
+};
+// ─── ADMIN: Update Invoice Module Settings ─────────────────────────────────
+exports.updateInvoiceSettings = async (req, res) => {
+  try {
+    const settings = await getOrInit();
+    const { invoice } = req.body;
+    if (!invoice) return errorResponse(res, 400, 'invoice payload required');
+
+    const boolFields = ['enabled','allowCancellation','allowRevoke','emailOnCreate','sendWhatsApp','autoDeductStock'];
+    const strFields  = ['invoicePrefix','businessState','defaultTerms','cancellationPolicy','whatsAppApiKey','whatsAppPhoneNumberId'];
+    const numFields  = ['defaultDueDays'];
+
+    // Initialize if missing
+    if (!settings.invoice) settings.invoice = {};
+    const inv = settings.invoice;
+
+    boolFields.forEach(f => { if (invoice[f] !== undefined) inv[f] = invoice[f] === true || invoice[f] === 'true'; });
+    strFields.forEach(f  => { if (invoice[f] !== undefined) inv[f] = invoice[f]; });
+    numFields.forEach(f  => { if (invoice[f] !== undefined) inv[f] = parseInt(invoice[f]) || 0; });
+
+    settings.invoice = inv;
+    settings.updatedBy = req.user._id;
+    settings.markModified('invoice');
+    await settings.save();
+
+    await logActivity(req.user._id, 'Settings Updated', 'Settings', settings._id, 'Updated Invoice Module settings', req.ip);
+
+    // Mask API key in response
+    const respInv = { ...settings.invoice.toObject?.() || settings.invoice };
+    if (respInv.whatsAppApiKey) respInv.whatsAppApiKey = '••••••••';
+    return successResponse(res, 200, 'Invoice settings updated', { invoice: respInv });
+  } catch (error) {
+    return errorResponse(res, 500, error.message);
+  }
+};
+
+// ─── ADMIN: Update Reports Visibility ──────────────────────────────────────
+exports.updateReportsVisibility = async (req, res) => {
+  try {
+    const settings = await getOrInit();
+    const { reports } = req.body;
+    if (reports) {
+      const keys = ['ordersReport','gstReport','productsReport','customersReport','stockReport','couponsReport','invoicesReport'];
+      keys.forEach(k => { if (reports[k] !== undefined) settings.reports[k] = reports[k] === true || reports[k] === 'true'; });
+    }
+    settings.updatedBy = req.user._id;
+    settings.markModified('reports');
+    await settings.save();
+    return successResponse(res, 200, 'Reports visibility updated', { reports: settings.reports });
   } catch (error) {
     return errorResponse(res, 500, error.message);
   }

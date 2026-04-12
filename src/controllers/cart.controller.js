@@ -35,7 +35,7 @@ exports.getCart = async (req, res) => {
   try {
     let cart = await Cart.findOne({ user: req.user._id }).populate(
       'items.product',
-      'name slug thumbnailImage basePrice discountPrice isActive productType isCustomizable customizationOptions'
+      'name slug thumbnailImage basePrice discountPrice isActive productType isCustomizable customizationOptions isGstApplicable gstPercentage gstIncludedInPrice'
     );
 
     if (!cart) {
@@ -273,18 +273,53 @@ exports.applyCoupon = async (req, res) => {
 
     const subtotal = cart.items.reduce((sum, item) => sum + item.unitPrice * item.quantity, 0);
 
-    if (subtotal < coupon.minOrderAmount)
+    let eligibleSubtotal = 0;
+    let hasEligibleItems = false;
+    
+    // Check applicable products and categories restrictions
+    const isProductRestricted = coupon.applicableProducts && coupon.applicableProducts.length > 0;
+    const isCategoryRestricted = coupon.applicableCategories && coupon.applicableCategories.length > 0;
+    
+    if (isProductRestricted || isCategoryRestricted) {
+      cart.items.forEach(item => {
+        let isEligible = false;
+        
+        // Exact product match
+        if (isProductRestricted && coupon.applicableProducts.some(pid => pid.toString() === item.product._id.toString())) {
+          isEligible = true;
+        }
+        
+        // Category match
+        if (isCategoryRestricted && item.product.category && coupon.applicableCategories.some(cid => cid.toString() === item.product.category.toString())) {
+          isEligible = true;
+        }
+
+        if (isEligible) {
+          hasEligibleItems = true;
+          eligibleSubtotal += item.unitPrice * item.quantity;
+        }
+      });
+      
+      if (!hasEligibleItems) {
+         return errorResponse(res, 400, 'This coupon is not applicable to any items in your cart');
+      }
+    } else {
+      hasEligibleItems = true;
+      eligibleSubtotal = subtotal; // No restrictions, whole cart is eligible
+    }
+
+    if (eligibleSubtotal < coupon.minOrderAmount)
       return errorResponse(
         res,
         400,
-        `Minimum order amount of ₹${coupon.minOrderAmount} required for this coupon`
+        `Minimum eligible order amount of ₹${coupon.minOrderAmount} required for this coupon`
       );
 
     let discountAmount = 0;
     if (coupon.discountType === 'flat') {
-      discountAmount = Math.min(coupon.discountValue, subtotal);
+      discountAmount = Math.min(coupon.discountValue, eligibleSubtotal);
     } else {
-      discountAmount = (subtotal * coupon.discountValue) / 100;
+      discountAmount = (eligibleSubtotal * coupon.discountValue) / 100;
       if (coupon.maxDiscountAmount) {
         discountAmount = Math.min(discountAmount, coupon.maxDiscountAmount);
       }

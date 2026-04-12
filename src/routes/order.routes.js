@@ -20,6 +20,8 @@ router.get('/', authorize('admin'), orderController.adminGetAllOrders);
 router.get('/admin/:id', authorize('admin'), orderController.adminGetOrderById);
 router.patch('/admin/:id/status', authorize('admin'), orderController.adminUpdateOrderStatus);
 router.patch('/admin/:id/tracking', authorize('admin'), orderController.adminAddTracking);
+router.post('/admin/:id/process-shipment', authorize('admin'), orderController.adminProcessShipment);
+router.post('/admin/:id/sync-tracking', authorize('admin'), orderController.adminSyncShiprocketTracking);
 router.patch('/admin/:id/cancellation-request', authorize('admin'), orderController.adminHandleCancellationRequest);
 router.patch('/admin/:id/return-request', authorize('admin'), orderController.adminHandleReturnRequest);
 

@@ -32,6 +32,8 @@ const contactRoutes = require('./routes/contact.routes');
 const ticketRoutes = require('./routes/ticket.routes');
 const auditLogRoutes = require('./routes/auditLog.routes');
 const bulkOrderRoutes = require('./routes/bulkOrder.routes');
+const reportsRoutes   = require('./routes/reports.routes');
+const invoiceRoutes   = require('./routes/invoice.routes');
 
 connectDB();
 
@@ -76,7 +78,7 @@ app.use(cors({
   origin: true,
   credentials: true,
   methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
-  allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With', 'Accept', 'Origin']
+  allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With', 'Accept', 'Origin', 'x-theme-version']
 }));
 app.use(globalLimiter);
 app.use(morgan(process.env.NODE_ENV === 'development' ? 'dev' : 'combined'));
@@ -85,6 +87,32 @@ app.use(express.urlencoded({ extended: true, limit: '10mb' }));
 
 // ─── Static Files ───────────────────────────────────────────
 app.use('/uploads', express.static(path.join(__dirname, '..', 'uploads')));
+
+// ─── Theme Changed Middleware ──────────────────────────────────────────
+// Reads x-theme-version header from client (ISO timestamp stored in cookie).
+// If DB themeUpdatedAt is newer, hijacks res.json to inject themeChanged:true.
+app.use(async (req, res, next) => {
+  const clientThemeVersion = req.headers['x-theme-version'];
+  if (!clientThemeVersion) return next(); // client has no cache yet — skip
+
+  try {
+    const SiteSettings = require('./models/SiteSettings.model');
+    const settings = await SiteSettings.findOne().select('updatedAt').lean();
+    const dbTime = settings?.updatedAt ? new Date(settings.updatedAt).getTime() : 0;
+    const clientTime = new Date(clientThemeVersion).getTime();
+
+    if (dbTime > clientTime) {
+      // Wrap res.json to append themeChanged flag transparently
+      const originalJson = res.json.bind(res);
+      res.json = (body) => {
+        if (body && typeof body === 'object') body.themeChanged = true;
+        return originalJson(body);
+      };
+    }
+  } catch (_) { /* non-fatal — continue */ }
+
+  next();
+});
 
 // ─── Maintenance Mode Guard ─────────────────────────────────
 app.use(async (req, res, next) => {
@@ -155,8 +183,10 @@ app.use('/api/legal', legalPageRoutes);
 app.use('/api/faqs', faqRoutes);
 app.use('/api/contact', contactRoutes);
 app.use('/api/tickets', ticketRoutes);
-app.use('/api/audit-logs', auditLogRoutes);
+app.use('/api/audit-logs',  auditLogRoutes);
 app.use('/api/bulk-orders', bulkOrderRoutes);
+app.use('/api/reports',     reportsRoutes);
+app.use('/api/invoices',    invoiceRoutes);
 
 // ─── Error Handlers ─────────────────────────────────────────
 app.use(notFound);

@@ -66,6 +66,10 @@ const couponSchema = new mongoose.Schema(
     applicableProducts: [{ type: mongoose.Schema.Types.ObjectId, ref: 'Product' }],
     applicableCategories: [{ type: mongoose.Schema.Types.ObjectId, ref: 'Category' }],
     targetedUsers: [{ type: mongoose.Schema.Types.ObjectId, ref: 'User' }],
+    // ── Advanced Conditions (all optional) ──────────────
+    isFirstOrderOnly: { type: Boolean, default: false },       // only for users with 0 previous orders
+    maxOrderAmount: { type: Number, default: null },           // max cart amount allowed
+    minAccountAgeDays: { type: Number, default: null },        // user account must be at least X days old
     createdBy: {
       type: mongoose.Schema.Types.ObjectId,
       ref: 'User',

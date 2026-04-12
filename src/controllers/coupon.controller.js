@@ -32,10 +32,13 @@ exports.createCoupon = async (req, res) => {
       discountValue: parseFloat(discountValue),
       maxDiscountAmount: maxDiscountAmount ? parseFloat(maxDiscountAmount) : null,
       minOrderAmount: parseFloat(minOrderAmount) || 0,
+      maxOrderAmount: req.body.maxOrderAmount ? parseFloat(req.body.maxOrderAmount) : null,
       usageLimit: usageLimit ? parseInt(usageLimit) : null,
       perUserLimit: parseInt(perUserLimit) || 1,
       validFrom: new Date(validFrom),
       validUntil: new Date(validUntil),
+      isFirstOrderOnly: req.body.isFirstOrderOnly === true || req.body.isFirstOrderOnly === 'true',
+      minAccountAgeDays: req.body.minAccountAgeDays ? parseInt(req.body.minAccountAgeDays) : null,
       applicableProducts: applicableProducts || [],
       applicableCategories: applicableCategories || [],
       createdBy: req.user._id,
@@ -58,6 +61,8 @@ exports.getAllCoupons = async (req, res) => {
     const [coupons, total] = await Promise.all([
       Coupon.find(filter)
         .populate('createdBy', 'name email')
+        .populate('targetedUsers', 'name email')
+        .populate('usedBy.user', 'name email')
         .sort({ createdAt: -1 })
         .skip(skip)
         .limit(parseInt(limit)),
@@ -76,7 +81,10 @@ exports.getAllCoupons = async (req, res) => {
 // ─── Get Coupon by ID (Admin) ──────────────────────────
 exports.getCouponById = async (req, res) => {
   try {
-    const coupon = await Coupon.findById(req.params.id).populate('createdBy', 'name email');
+    const coupon = await Coupon.findById(req.params.id)
+      .populate('createdBy', 'name email')
+      .populate('targetedUsers', 'name email')
+      .populate('usedBy.user', 'name email');
     if (!coupon) return errorResponse(res, 404, 'Coupon not found');
     return successResponse(res, 200, 'Coupon fetched', { coupon });
   } catch (error) {
@@ -96,10 +104,13 @@ exports.updateCoupon = async (req, res) => {
     if (discountValue !== undefined) coupon.discountValue = parseFloat(discountValue);
     if (maxDiscountAmount !== undefined) coupon.maxDiscountAmount = maxDiscountAmount ? parseFloat(maxDiscountAmount) : null;
     if (minOrderAmount !== undefined) coupon.minOrderAmount = parseFloat(minOrderAmount);
+    if (req.body.maxOrderAmount !== undefined) coupon.maxOrderAmount = req.body.maxOrderAmount ? parseFloat(req.body.maxOrderAmount) : null;
     if (usageLimit !== undefined) coupon.usageLimit = usageLimit ? parseInt(usageLimit) : null;
     if (perUserLimit !== undefined) coupon.perUserLimit = parseInt(perUserLimit);
     if (validUntil !== undefined) coupon.validUntil = new Date(validUntil);
     if (isActive !== undefined) coupon.isActive = isActive === true || isActive === 'true';
+    if (req.body.isFirstOrderOnly !== undefined) coupon.isFirstOrderOnly = req.body.isFirstOrderOnly === true || req.body.isFirstOrderOnly === 'true';
+    if (req.body.minAccountAgeDays !== undefined) coupon.minAccountAgeDays = req.body.minAccountAgeDays ? parseInt(req.body.minAccountAgeDays) : null;
 
     await coupon.save();
     return successResponse(res, 200, 'Coupon updated', { coupon });
@@ -133,34 +144,59 @@ exports.toggleCouponStatus = async (req, res) => {
 };
 
 // ─── Validate Coupon (Client - just check without applying) ──────
-exports.validateCoupon = async (req, res) => {
+ exports.validateCoupon = async (req, res) => {
   try {
     const { code, cartTotal } = req.body;
     if (!code) return errorResponse(res, 400, 'Coupon code is required');
 
+    const Order = require('../models/Order.model');
+    const User = require('../models/User.model');
+
     const coupon = await Coupon.findOne({ code: code.toUpperCase(), isActive: true });
     if (!coupon) return errorResponse(res, 404, 'Invalid coupon code');
 
+    // 1. Targeted users check
     if (coupon.targetedUsers && coupon.targetedUsers.length > 0) {
-      const isTargeted = coupon.targetedUsers.some(
-        (userId) => userId.toString() === req.user._id.toString()
-      );
+      const isTargeted = coupon.targetedUsers.some(uid => uid.toString() === req.user._id.toString());
       if (!isTargeted) return errorResponse(res, 403, 'This coupon is not applicable to your account');
     }
 
+    // 2. Date validity
     const now = new Date();
     if (now < coupon.validFrom || now > coupon.validUntil)
       return errorResponse(res, 400, 'Coupon is expired or not yet active');
 
+    // 3. Global usage cap
     if (coupon.usageLimit !== null && coupon.usageCount >= coupon.usageLimit)
       return errorResponse(res, 400, 'Coupon has reached its usage limit');
 
+    // 4. Per-user usage
     const userUsage = coupon.usedBy.filter(u => u.user.toString() === req.user._id.toString()).length;
     if (userUsage >= coupon.perUserLimit)
-      return errorResponse(res, 400, 'You have already used this coupon');
+      return errorResponse(res, 400, 'You have already used this coupon the maximum number of times');
 
-    if (cartTotal && parseFloat(cartTotal) < coupon.minOrderAmount)
+    // 5. Min order amount
+    const orderTotal = cartTotal ? parseFloat(cartTotal) : 0;
+    if (orderTotal < coupon.minOrderAmount)
       return errorResponse(res, 400, `Minimum order amount of ₹${coupon.minOrderAmount} required`);
+
+    // 6. Max order amount
+    if (coupon.maxOrderAmount !== null && orderTotal > coupon.maxOrderAmount)
+      return errorResponse(res, 400, `This coupon is only valid for orders up to ₹${coupon.maxOrderAmount}`);
+
+    // 7. First order only
+    if (coupon.isFirstOrderOnly) {
+      const prevOrders = await Order.countDocuments({ user: req.user._id, status: { $ne: 'cancelled' } });
+      if (prevOrders > 0) return errorResponse(res, 400, 'This coupon is only valid on your first order');
+    }
+
+    // 8. Min account age (in days)
+    if (coupon.minAccountAgeDays !== null) {
+      const user = await User.findById(req.user._id).select('createdAt');
+      const accountAgeDays = (Date.now() - new Date(user.createdAt).getTime()) / (1000 * 60 * 60 * 24);
+      if (accountAgeDays < coupon.minAccountAgeDays)
+        return errorResponse(res, 400, `Your account must be at least ${coupon.minAccountAgeDays} days old to use this coupon`);
+    }
 
     return successResponse(res, 200, 'Coupon is valid', {
       coupon: {
@@ -172,6 +208,53 @@ exports.validateCoupon = async (req, res) => {
         minOrderAmount: coupon.minOrderAmount,
       },
     });
+  } catch (error) {
+    return errorResponse(res, 500, error.message);
+  }
+};
+
+// ─── Get Eligible Coupons for current user ─────────────────────────────
+ exports.getEligibleCoupons = async (req, res) => {
+  try {
+    const Order = require('../models/Order.model');
+    const User = require('../models/User.model');
+    const now = new Date();
+    const userId = req.user._id;
+
+    const user = await User.findById(userId).select('createdAt');
+    const accountAgeDays = (Date.now() - new Date(user.createdAt).getTime()) / (1000 * 60 * 60 * 24);
+    const prevOrderCount = await Order.countDocuments({ user: userId, status: { $ne: 'cancelled' } });
+    const cartTotal = parseFloat(req.query.cartTotal || 0);
+
+    // Find all publicly-eligible or user-targeted active coupons
+    const allCoupons = await Coupon.find({
+      isActive: true,
+      validFrom: { $lte: now },
+      validUntil: { $gte: now },
+      $or: [
+        { targetedUsers: { $size: 0 } },
+        { targetedUsers: userId },
+      ],
+    }).select('-usedBy');
+
+    const eligible = allCoupons.filter(c => {
+      // Per-user usage check
+      const usedByUser = c.usedBy?.filter(u => u.user?.toString() === userId.toString()).length || 0;
+      if (usedByUser >= c.perUserLimit) return false;
+      // Usage cap
+      if (c.usageLimit !== null && c.usageCount >= c.usageLimit) return false;
+      // Min order
+      if (cartTotal > 0 && cartTotal < c.minOrderAmount) return false;
+      // Max order
+      if (c.maxOrderAmount !== null && cartTotal > 0 && cartTotal > c.maxOrderAmount) return false;
+      // First order only
+      if (c.isFirstOrderOnly && prevOrderCount > 0) return false;
+      // Min account age
+      if (c.minAccountAgeDays !== null && accountAgeDays < c.minAccountAgeDays) return false;
+      return true;
+    });
+
+    return successResponse(res, 200, 'Eligible coupons', { coupons: eligible });
   } catch (error) {
     return errorResponse(res, 500, error.message);
   }
@@ -245,6 +328,7 @@ exports.createTargetedCampaign = async (req, res) => {
       description: descriptionStr,
       discountType,
       discountValue: parseFloat(discountValue),
+      validFrom: new Date(),
       validUntil,
       perUserLimit: 1,
       targetedUsers: targetUserIds,

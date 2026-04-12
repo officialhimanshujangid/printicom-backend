@@ -3,6 +3,7 @@ const Product = require('../models/Product.model');
 const Category = require('../models/Category.model');
 const Order = require('../models/Order.model');
 const { successResponse, errorResponse, paginatedResponse } = require('../utils/response.utils');
+const { logActivity } = require('./auditLog.controller');
 
 // ─── Helper: parse relatedTo entries from request ──────────
 // Supports two formats from multipart/form-data:
@@ -84,6 +85,10 @@ exports.createProduct = async (req, res) => {
           ? JSON.parse(customizationOptions)
           : customizationOptions
         : [],
+      isGstApplicable: req.body.isGstApplicable === 'true' || req.body.isGstApplicable === true,
+      gstPercentage: req.body.gstPercentage !== '' && req.body.gstPercentage != null
+        ? parseFloat(req.body.gstPercentage) : null,
+      gstIncludedInPrice: req.body.gstIncludedInPrice || 'global',
       isFeatured: isFeatured === 'true' || isFeatured === true,
       minOrderQuantity: parseInt(minOrderQuantity) || 1,
       maxOrderQuantity: parseInt(maxOrderQuantity) || 100,
@@ -107,6 +112,8 @@ exports.createProduct = async (req, res) => {
     const product = await Product.create(productData);
     await product.populate('category', 'name slug');
     await product.populate('relatedTos.relatedTo', 'name slug icon');
+
+    await logActivity(req.user._id, 'Product Created', 'Product', product._id, `Product "${product.name}" created`, req.ip);
 
     return successResponse(res, 201, 'Product created successfully', { product });
   } catch (error) {
@@ -252,6 +259,17 @@ exports.updateProduct = async (req, res) => {
     if (req.body.isCustomizable !== undefined) {
       updateData.isCustomizable = req.body.isCustomizable === 'true' || req.body.isCustomizable === true;
     }
+    // Handle GST fields
+    if (req.body.isGstApplicable !== undefined) {
+      updateData.isGstApplicable = req.body.isGstApplicable === 'true' || req.body.isGstApplicable === true;
+    }
+    if (req.body.gstPercentage !== undefined) {
+      updateData.gstPercentage = req.body.gstPercentage !== '' && req.body.gstPercentage != null
+        ? parseFloat(req.body.gstPercentage) : null;
+    }
+    if (req.body.gstIncludedInPrice !== undefined) {
+      updateData.gstIncludedInPrice = req.body.gstIncludedInPrice;
+    }
     if (minOrderQuantity) updateData.minOrderQuantity = parseInt(minOrderQuantity);
     if (maxOrderQuantity) updateData.maxOrderQuantity = parseInt(maxOrderQuantity);
     if (deliveryDays) updateData.deliveryDays = parseInt(deliveryDays);
@@ -283,6 +301,8 @@ exports.updateProduct = async (req, res) => {
 
     if (!product) return errorResponse(res, 404, 'Product not found');
 
+    await logActivity(req.user._id, 'Product Updated', 'Product', product._id, `Product "${product.name}" updated`, req.ip);
+
     return successResponse(res, 200, 'Product updated successfully', { product });
   } catch (error) {
     return errorResponse(res, 500, error.message);
@@ -294,6 +314,9 @@ exports.deleteProduct = async (req, res) => {
   try {
     const product = await Product.findByIdAndDelete(req.params.id);
     if (!product) return errorResponse(res, 404, 'Product not found');
+    
+    await logActivity(req.user._id, 'Product Deleted', 'Product', product._id, `Product "${product.name}" deleted`, req.ip);
+    
     return successResponse(res, 200, 'Product deleted successfully');
   } catch (error) {
     return errorResponse(res, 500, error.message);
@@ -308,6 +331,8 @@ exports.toggleProductStatus = async (req, res) => {
 
     product.isActive = !product.isActive;
     await product.save();
+
+    await logActivity(req.user._id, 'Product Status Toggled', 'Product', product._id, `Product "${product.name}" ${product.isActive ? 'activated' : 'deactivated'}`, req.ip);
 
     return successResponse(
       res,

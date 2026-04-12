@@ -22,6 +22,9 @@ router.put('/seo', ...adminOnly, settingsController.updateSEO);
 router.put('/social-links', ...adminOnly, settingsController.updateSocialLinks);
 router.put('/tax', ...adminOnly, settingsController.updateTax);
 router.put('/order-settings', ...adminOnly, settingsController.updateOrderSettings);
+router.put('/theme', ...adminOnly, settingsController.updateTheme);
 router.patch('/maintenance', ...adminOnly, settingsController.toggleMaintenance);
+router.put('/invoice',        ...adminOnly, settingsController.updateInvoiceSettings);
+router.put('/reports-visibility', ...adminOnly, settingsController.updateReportsVisibility);
 
 module.exports = router;

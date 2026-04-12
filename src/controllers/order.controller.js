@@ -5,6 +5,7 @@ const Product = require('../models/Product.model');
 const Coupon = require('../models/Coupon.model');
 const Address = require('../models/Address.model');
 const User = require('../models/User.model');
+const { logActivity } = require('./auditLog.controller');
 const { successResponse, errorResponse, paginatedResponse } = require('../utils/response.utils');
 const sendEmail = require('../config/email');
 const { 
@@ -16,14 +17,40 @@ const SHIPPING_CHARGE_THRESHOLD = 499; // free shipping above ₹499
 const STANDARD_SHIPPING = 49;
 
 // ─── Helper: calculate shipping ───────────────────────
-const calcShipping = (subtotal) => {
-  return subtotal >= SHIPPING_CHARGE_THRESHOLD ? 0 : STANDARD_SHIPPING;
+const calcShipping = (subtotal, threshold = SHIPPING_CHARGE_THRESHOLD, charge = STANDARD_SHIPPING) => {
+  return subtotal >= threshold ? 0 : charge;
+};
+
+// ─── Helper: compute GST for a product at a given selling price ─────
+// Returns { baseUnitPrice, gstRate, gstAmountPerUnit, effectiveUnitPrice }
+// effectiveUnitPrice is what the customer pays per unit
+const computeGst = (sellingPrice, product, gstSettings) => {
+  if (!gstSettings?.enabled || !product.isGstApplicable) {
+    return { baseUnitPrice: sellingPrice, gstRate: 0, gstAmountPerUnit: 0, effectiveUnitPrice: sellingPrice };
+  }
+  const rate = (product.gstPercentage != null) ? product.gstPercentage : (gstSettings.gstPercentage ?? 18);
+  
+  // check product level override for included in price
+  let includedInPrice = gstSettings.includedInPrice;
+  if (product.gstIncludedInPrice === 'yes') includedInPrice = true;
+  else if (product.gstIncludedInPrice === 'no') includedInPrice = false;
+
+  if (includedInPrice) {
+    // Price already includes GST — extract base
+    const base = sellingPrice / (1 + rate / 100);
+    const gstPerUnit = sellingPrice - base;
+    return { baseUnitPrice: parseFloat(base.toFixed(2)), gstRate: rate, gstAmountPerUnit: parseFloat(gstPerUnit.toFixed(2)), effectiveUnitPrice: sellingPrice };
+  } else {
+    // GST added on top
+    const gstPerUnit = sellingPrice * rate / 100;
+    return { baseUnitPrice: sellingPrice, gstRate: rate, gstAmountPerUnit: parseFloat(gstPerUnit.toFixed(2)), effectiveUnitPrice: parseFloat((sellingPrice + gstPerUnit).toFixed(2)) };
+  }
 };
 
 // ─── Place Order ───────────────────────────────────────
 exports.placeOrder = async (req, res) => {
   try {
-    const { addressId, paymentMethod, customerNote } = req.body;
+    const { addressId, paymentMethod, customerNote, shippingMethod = 'standard' } = req.body;
 
     if (!addressId) return errorResponse(res, 400, 'Delivery address is required');
     if (!paymentMethod) return errorResponse(res, 400, 'Payment method is required');
@@ -36,21 +63,41 @@ exports.placeOrder = async (req, res) => {
     const address = await Address.findOne({ _id: addressId, user: req.user._id });
     if (!address) return errorResponse(res, 404, 'Delivery address not found');
 
-    // Fetch cart with products
-    const cart = await Cart.findOne({ user: req.user._id }).populate('items.product');
+    // Fetch cart — include GST fields in product snapshot
+    const cart = await Cart.findOne({ user: req.user._id }).populate(
+      'items.product',
+      'name slug thumbnailImage productType deliveryDays stock maxOrderQuantity isActive isGstApplicable gstPercentage gstIncludedInPrice'
+    );
     if (!cart || cart.items.length === 0) return errorResponse(res, 400, 'Cart is empty');
 
-    // Validate all items
+    // Load site settings for GST + shipping from DB (source of truth)
+    const SiteSettings = require('../models/SiteSettings.model');
+    const siteSettings = await SiteSettings.findOne();
+    const gstSettings = siteSettings?.tax || {};
+    const freeShippingThreshold = siteSettings?.shipping?.freeShippingThreshold || SHIPPING_CHARGE_THRESHOLD;
+    const standardShippingCharge = siteSettings?.shipping?.standardShippingCharge || STANDARD_SHIPPING;
+    const expressShippingCharge = siteSettings?.shipping?.expressShippingCharge || 99;
+    const expressShippingEnabled = siteSettings?.shipping?.expressShippingEnabled || false;
+
+    // Validate items and compute GST breakdown per item
     const orderItems = [];
+    let orderGstTotal = 0;
+
     for (const item of cart.items) {
       const product = item.product;
       if (!product || !product.isActive)
         return errorResponse(res, 400, `Product "${item.product?.name || item.product}" is not available`);
 
-      // ─── Stock check per item ───────────────────────────────────
+      // Stock check
       if (product.stock !== undefined && product.stock !== null && product.stock < item.quantity) {
         return errorResponse(res, 400, `Insufficient stock for "${product.name}" (available: ${product.stock})`);
       }
+
+      // GST computed on the effective selling price stored in cart (discountPrice already applied by cart controller)
+      const { baseUnitPrice, gstRate, gstAmountPerUnit, effectiveUnitPrice } = computeGst(item.unitPrice, product, gstSettings);
+      const lineGst = parseFloat((gstAmountPerUnit * item.quantity).toFixed(2));
+      const lineTotal = parseFloat((effectiveUnitPrice * item.quantity).toFixed(2));
+      orderGstTotal += lineGst;
 
       orderItems.push({
         product: product._id,
@@ -63,21 +110,30 @@ exports.placeOrder = async (req, res) => {
         variantId: item.variantId || null,
         variantName: item.variantName || null,
         quantity: item.quantity,
-        unitPrice: item.unitPrice,
-        lineTotal: item.unitPrice * item.quantity,
+        unitPrice: effectiveUnitPrice,  // per-unit price customer pays (GST inclusive if applicable)
+        baseUnitPrice,                   // pre-GST price (equals unitPrice when GST not applicable)
+        gstRate,                         // % applied (0 if N/A)
+        gstAmount: lineGst,              // total GST for this line
+        lineTotal,
         customization: item.customization,
       });
     }
 
-    const subtotal = orderItems.reduce((s, i) => s + i.lineTotal, 0);
-    const shippingCharge = calcShipping(subtotal);
-    const couponDiscount = cart.appliedCoupon?.discountAmount || 0;
-    const totalAmount = Math.max(0, subtotal + shippingCharge - couponDiscount);
+    orderGstTotal = parseFloat(orderGstTotal.toFixed(2));
+    const subtotal = parseFloat(orderItems.reduce((s, i) => s + i.lineTotal, 0).toFixed(2));
 
-    // Estimated delivery date (max deliveryDays from all products)
-    const maxDeliveryDays = Math.max(
-      ...cart.items.map((i) => i.product.deliveryDays || 5)
-    );
+    let shippingCharge = 0;
+    if (shippingMethod === 'express' && expressShippingEnabled) {
+      shippingCharge = expressShippingCharge;
+    } else {
+      shippingCharge = calcShipping(subtotal, freeShippingThreshold, standardShippingCharge);
+    }
+    
+    const couponDiscount = cart.appliedCoupon?.discountAmount || 0;
+    const totalAmount = parseFloat(Math.max(0, subtotal + shippingCharge - couponDiscount).toFixed(2));
+
+    // Estimated delivery date
+    const maxDeliveryDays = Math.max(...cart.items.map((i) => i.product.deliveryDays || 5));
     const estimatedDeliveryDate = new Date(Date.now() + maxDeliveryDays * 24 * 60 * 60 * 1000);
 
     const orderData = {
@@ -86,6 +142,7 @@ exports.placeOrder = async (req, res) => {
       subtotal,
       shippingCharge,
       couponDiscount,
+      gstTotal: orderGstTotal,
       totalAmount,
       shippingAddress: {
         fullName: address.fullName,
@@ -97,11 +154,12 @@ exports.placeOrder = async (req, res) => {
         pincode: address.pincode,
         country: address.country,
       },
+      shippingMethod,
       coupon: cart.appliedCoupon?.code
         ? { code: cart.appliedCoupon.code, discountAmount: couponDiscount }
         : { code: null, discountAmount: 0 },
       paymentMethod,
-      paymentStatus: paymentMethod === 'cod' ? 'pending' : paymentMethod === 'bank_transfer' ? 'pending' : 'pending',
+      paymentStatus: 'pending',
       status: 'pending',
       estimatedDeliveryDate,
       customerNote: customerNote || null,
@@ -110,45 +168,33 @@ exports.placeOrder = async (req, res) => {
 
     const order = await Order.create(orderData);
 
-    // ─── Deduct stock for each product item ───────────────────
-    for (const item of cart.items) {
-      const product = item.product;
-      if (product.stock !== undefined && product.stock !== null) {
-        await Product.findByIdAndUpdate(product._id, {
-          $inc: { stock: -item.quantity },
-        });
-      }
-    }
+    // Stock deduction is now deferred to order confirmation if autoDeductStock is enabled.
 
-    // Update coupon usage if applied
+    // Update coupon usage
     if (cart.appliedCoupon?.code) {
       await Coupon.findOneAndUpdate(
         { code: cart.appliedCoupon.code },
-        {
-          $inc: { usageCount: 1 },
-          $push: { usedBy: { user: req.user._id } },
-        }
+        { $inc: { usageCount: 1 }, $push: { usedBy: { user: req.user._id } } }
       );
     }
 
-    // Clear cart after order
+    // Clear cart
     cart.items = [];
     cart.appliedCoupon = { code: null, discountAmount: 0 };
     await cart.save();
 
+    await logActivity(req.user._id, 'Order Placed', 'Order', order._id, `Order #${order.orderNumber} placed for ₹${order.totalAmount}`, req.ip);
+
     await order.populate('items.product', 'name slug thumbnailImage');
 
-    // If Razorpay — create Razorpay order
+    // Razorpay
     let razorpayOrder = null;
     if (paymentMethod === 'razorpay') {
       try {
         const Razorpay = require('razorpay');
-        const rzp = new Razorpay({
-          key_id: process.env.RAZORPAY_KEY_ID,
-          key_secret: process.env.RAZORPAY_KEY_SECRET,
-        });
+        const rzp = new Razorpay({ key_id: process.env.RAZORPAY_KEY_ID, key_secret: process.env.RAZORPAY_KEY_SECRET });
         razorpayOrder = await rzp.orders.create({
-          amount: Math.round(totalAmount * 100), // paise
+          amount: Math.round(totalAmount * 100),
           currency: 'INR',
           receipt: order.orderNumber,
           notes: { orderId: order._id.toString() },
@@ -156,12 +202,11 @@ exports.placeOrder = async (req, res) => {
         order.paymentDetails = { razorpayOrderId: razorpayOrder.id };
         await order.save();
       } catch (rzpError) {
-        // Continue without Razorpay if keys not configured
         console.warn('Razorpay not configured:', rzpError.message);
       }
     }
 
-    // Send confirmation email for COD orders immediately
+    // Confirmation email (COD)
     if (paymentMethod === 'cod') {
       try {
         const user = await User.findById(req.user._id);
@@ -176,10 +221,52 @@ exports.placeOrder = async (req, res) => {
     return successResponse(res, 201, 'Order placed successfully', {
       order,
       razorpayOrder,
-      pricing: { subtotal, shippingCharge, couponDiscount, totalAmount },
+      pricing: { subtotal, shippingCharge, couponDiscount, gstTotal: orderGstTotal, totalAmount },
     });
   } catch (error) {
     return errorResponse(res, 500, error.message);
+  }
+};
+
+// ─── Shared Confirmation Logic ───────────────────────
+const processOrderConfirmation = async (order, reqUser) => {
+  try {
+    const SiteSettings = require('../models/SiteSettings.model');
+    const { createInvoiceFromOrder } = require('./invoice.controller');
+    
+    const settings = await SiteSettings.findOne().lean();
+    
+    // Auto-create Invoice
+    if (settings?.invoice?.enabled) {
+      if (!order.invoiceProcessed) {
+        await createInvoiceFromOrder(order, reqUser._id);
+        order.invoiceProcessed = true;
+      } else {
+        // Sync invoice status if payment status changed
+        try {
+          const Invoice = require('../models/Invoice.model');
+          const invoiceStatus = order.paymentStatus === 'paid' ? 'paid' : 'payment_pending';
+          await Invoice.findOneAndUpdate({ linkedOrder: order._id }, { status: invoiceStatus });
+        } catch (e) {
+          console.error('[Invoice Sync Error]:', e.message);
+        }
+      }
+    }
+
+    // Deduct Stock
+    if (settings?.invoice?.autoDeductStock && !order.stockDeducted) {
+      for (const item of order.items) {
+        if (item.product) {
+          await Product.findByIdAndUpdate(item.product, { $inc: { stock: -item.quantity } });
+        }
+      }
+      order.stockDeducted = true;
+    }
+    
+    order.invoiceProcessed = true;
+    await order.save();
+  } catch (error) {
+    console.error('[Confirmation Logic Error]:', error.message);
   }
 };
 
@@ -209,6 +296,8 @@ exports.verifyPayment = async (req, res) => {
     };
     order.statusHistory.push({ status: 'confirmed', note: 'Payment verified successfully' });
     await order.save();
+
+    await processOrderConfirmation(order, req.user);
 
     // Send confirmation email after payment
     try {
@@ -443,12 +532,48 @@ exports.adminUpdateOrderStatus = async (req, res) => {
     const order = await Order.findById(req.params.id);
     if (!order) return errorResponse(res, 404, 'Order not found');
 
+    const previousStatus = order.status;
+
     order.status = status;
     order.statusHistory.push({
       status,
       note: note || `Status updated to ${status}`,
       updatedBy: req.user._id,
     });
+
+    if (req.body.markPaid) {
+      order.paymentStatus = 'paid';
+    }
+
+    if (status === 'cancelled' && previousStatus !== 'cancelled') {
+       if (order.stockDeducted) {
+         for (const item of order.items) {
+           if (item.product) {
+             const Product = require('../models/Product.model');
+             await Product.findByIdAndUpdate(item.product, { $inc: { stock: item.quantity } });
+           }
+         }
+         order.stockDeducted = false;
+       }
+
+       if (order.coupon && order.coupon.code) {
+         const Coupon = require('../models/Coupon.model');
+         await Coupon.findOneAndUpdate(
+           { code: order.coupon.code },
+           { $inc: { usageCount: -1 }, $pull: { usedBy: { user: order.user } } }
+         );
+       }
+
+       order.cancelledAt = new Date();
+       order.cancellationReason = note || 'Manually cancelled by admin';
+
+       try {
+         const Invoice = require('../models/Invoice.model');
+         await Invoice.findOneAndUpdate({ linkedOrder: order._id }, { status: 'cancelled', cancelReason: 'Order cancelled' });
+       } catch (e) {
+         console.error('Failed to cancel invoice:', e.message);
+       }
+    }
 
     if (status === 'shipped') {
       if (trackingNumber) order.trackingNumber = trackingNumber;
@@ -459,35 +584,57 @@ exports.adminUpdateOrderStatus = async (req, res) => {
     if (status === 'delivered') {
       order.deliveredAt = new Date();
       order.paymentStatus = 'paid';
+
+      try {
+        const Invoice = require('../models/Invoice.model');
+        await Invoice.findOneAndUpdate({ linkedOrder: order._id }, { status: 'paid' });
+      } catch (e) {
+        console.error('Failed to update invoice paid status:', e.message);
+      }
     }
 
     if (status === 'refunded') {
       order.paymentStatus = 'refunded';
+      
+      // Update Invoice status to refunded if exists
+      try {
+        const Invoice = require('../models/Invoice.model');
+        await Invoice.findOneAndUpdate({ linkedOrder: order._id }, { status: 'refunded' });
+      } catch (e) {
+        console.error('Failed to update invoice refund status:', e.message);
+      }
     }
 
     await order.save();
+    
+    // Call confirmation logic if confirming, or as a fallback on delivery if skipped
+    if ((status === 'confirmed' && previousStatus !== 'confirmed') || (status === 'delivered' && !order.invoiceProcessed)) {
+      await processOrderConfirmation(order, req.user);
+    }
+    
+    await logActivity(req.user._id, `Order Status Updated`, 'Order', order._id, `Order #${order.orderNumber} status changed to ${status}`, req.ip);
     
     // Send status update emails
     try {
       const user = await User.findById(order.user);
       let subject = '';
       let html = '';
-      
+
       if (status === 'shipped') {
-        subject = `🚀 Your Order #${order.orderNumber} has been Shipped!`;
+        subject = `\u{1F680} Your Order #${order.orderNumber} has been Shipped!`;
         html = orderShippedTemplate(user.name, order);
       } else if (status === 'delivered') {
-        subject = `🎁 Delivered: Your Order #${order.orderNumber}`;
+        subject = `\u{1F381} Delivered: Your Order #${order.orderNumber}`;
         html = orderDeliveredTemplate(user.name, order);
       } else if (status === 'cancelled') {
-        subject = `❌ Order Cancelled: #${order.orderNumber}`;
+        subject = `\u{274C} Order Cancelled: #${order.orderNumber}`;
         html = orderCancelledTemplate(user.name, order, note);
       }
-      
+
       if (subject && html) {
         await sendEmail({ to: user.email, subject, html });
       }
-    } catch (e) { console.error('Email error during status update:', e.message); }
+    } catch (e) { console.error('[Email] Status update email error:', e.message); }
 
     return successResponse(res, 200, 'Order status updated', { order });
   } catch (error) {
@@ -495,7 +642,157 @@ exports.adminUpdateOrderStatus = async (req, res) => {
   }
 };
 
+exports.adminProcessShipment = async (req, res) => {
+  try {
+    const { method, trackingNumber, trackingUrl, courierName } = req.body;
+    const order = await Order.findById(req.params.id)
+      .populate('user', 'name email phone')
+      .populate('items.product', 'name slug thumbnailImage isGstApplicable gstPercentage');
+    
+    if (!order) return errorResponse(res, 404, 'Order not found');
+    
+    if (['shipped', 'delivered', 'cancelled', 'refunded'].includes(order.status)) {
+      return errorResponse(res, 400, `Cannot process shipment for order in '${order.status}' status.`);
+    }
+
+    if (method === 'shiprocket') {
+      const { createOrderAndAwb } = require('../utils/shiprocket.utils');
+      try {
+         const srData = await createOrderAndAwb(order, order.items);
+         
+         order.isManualShipped = false;
+         order.shipmentId = srData.shipmentId;
+         order.trackingNumber = srData.awbCode || null;
+         order.courierName = srData.courierName || 'Shiprocket Partner';
+         order.labelUrl = srData.labelUrl || null;
+         order.trackingUrl = srData.awbCode ? `https://shiprocket.co/tracking/${srData.awbCode}` : null;
+         order.status = srData.awbCode ? 'shipped' : 'ready_to_ship';
+         order.statusHistory.push({
+           status: order.status,
+           note: `Shipment created via Shiprocket. Shipment ID: ${srData.shipmentId}. ${srData.awbCode ? `AWB: ${srData.awbCode}` : 'AWB pending assignment.'}`,
+           updatedBy: req.user._id
+         });
+      } catch (err) {
+         return errorResponse(res, 500, err.message);
+      }
+    } else if (method === 'manual') {
+       if (!trackingNumber || !courierName) {
+          return errorResponse(res, 400, 'Tracking number and courier name are required for manual shipment.');
+       }
+       order.isManualShipped = true;
+       order.trackingNumber = trackingNumber;
+       order.courierName = courierName;
+       order.trackingUrl = trackingUrl || null;
+       order.status = 'shipped';
+       order.statusHistory.push({
+         status: 'shipped',
+         note: `Manually shipped via ${courierName}. AWB: ${trackingNumber}`,
+         updatedBy: req.user._id
+       });
+    } else {
+       return errorResponse(res, 400, 'Invalid shipment method. Use "shiprocket" or "manual".');
+    }
+
+    await order.save();
+    await logActivity(req.user._id, 'Shipment Processed', 'Order', order._id, `Shipment for #${order.orderNumber} processed via ${method}`, req.ip);
+
+    // Send shipment confirmation email
+    if (order.status === 'shipped') {
+       try {
+         const user = order.user;
+         if (user?.email) {
+           await sendEmail({
+             to: user.email,
+             subject: `\u{1F680} Your Order #${order.orderNumber} Has Been Shipped!`,
+             html: orderShippedTemplate(user.name, order)
+           });
+         }
+       } catch (e) {
+          console.error('[Email] Shipment email error:', e.message);
+       }
+    }
+
+    return successResponse(res, 200, 'Shipment processed successfully', { order });
+  } catch (error) {
+    return errorResponse(res, 500, error.message);
+  }
+};
+
+// ─── Admin: Sync Tracking from Shiprocket ─────────────────────
+exports.adminSyncShiprocketTracking = async (req, res) => {
+  try {
+    const order = await Order.findById(req.params.id).populate('user', 'name email');
+    if (!order) return errorResponse(res, 404, 'Order not found');
+    if (order.isManualShipped !== false) {
+      return errorResponse(res, 400, 'This order was not shipped via Shiprocket.');
+    }
+    if (!order.trackingNumber) {
+      return errorResponse(res, 400, 'No AWB code found. Cannot sync tracking.');
+    }
+
+    const { getTrackingStatus, mapShiprocketStatusToOrderStatus } = require('../utils/shiprocket.utils');
+    
+    const trackingResult = await getTrackingStatus(order.trackingNumber);
+    const { currentStatus, etd, shipmentTrack, shipmentActivity } = trackingResult;
+    
+    // Determine if status should be auto-updated
+    const mappedStatus = mapShiprocketStatusToOrderStatus(currentStatus);
+    let statusChanged = false;
+
+    if (mappedStatus && mappedStatus !== order.status) {
+      const previousStatus = order.status;
+      order.status = mappedStatus;
+      order.statusHistory.push({
+        status: mappedStatus,
+        note: `Auto-synced from Shiprocket: "${currentStatus}"`,
+        updatedBy: req.user._id
+      });
+      statusChanged = true;
+
+      // Handle delivered status
+      if (mappedStatus === 'delivered' && !order.deliveredAt) {
+        order.deliveredAt = new Date();
+        order.paymentStatus = 'paid';
+      }
+
+      await order.save();
+
+      // Send delivery email if just delivered
+      if (mappedStatus === 'delivered' && previousStatus !== 'delivered') {
+        try {
+          const user = order.user;
+          if (user?.email) {
+            await sendEmail({
+              to: user.email,
+              subject: `\u{1F381} Delivered: Your Order #${order.orderNumber}`,
+              html: orderDeliveredTemplate(user.name, order)
+            });
+          }
+        } catch (e) {
+          console.error('[Email] Delivery email error:', e.message);
+        }
+      }
+    }
+
+    await logActivity(req.user._id, 'Tracking Synced', 'Order', order._id, `Shiprocket tracking synced for #${order.orderNumber}. Status: ${currentStatus}`, req.ip);
+
+    return successResponse(res, 200, 'Tracking synced from Shiprocket', {
+      order,
+      tracking: {
+        currentStatus,
+        etd,
+        statusChanged,
+        mappedStatus,
+        latestEvents: (shipmentTrack || []).slice(0, 5),
+      }
+    });
+  } catch (error) {
+    return errorResponse(res, 500, error.message);
+  }
+};
+
 // ─── Admin: Add Tracking ───────────────────────────────
+
 exports.adminAddTracking = async (req, res) => {
   try {
     const { trackingNumber, trackingUrl, courierName } = req.body;
@@ -574,40 +871,71 @@ exports.adminHandleCancellationRequest = async (req, res) => {
   }
 };
 
-// ─── Admin: Handle Return Request ────────────────────────
+// ─── Admin: Handle Return Request ──────────────────
 exports.adminHandleReturnRequest = async (req, res) => {
   try {
-    const { action } = req.body; // 'approve', 'reject', 'receive_items', 'issue_refund'
-    const order = await Order.findById(req.params.id);
+    const { action } = req.body;
+    const order = await Order.findById(req.params.id).populate('user', 'name email');
     if (!order) return errorResponse(res, 404, 'Order not found');
 
-    if (!order.returnRequest || !order.returnRequest.requested) {
+    if (!order.returnRequest?.requested) {
       return errorResponse(res, 400, 'No return request found for this order');
     }
 
     order.returnRequest.processedAt = new Date();
     order.returnRequest.processedBy = req.user._id;
 
+    let emailSubject = '';
+    let emailNote = '';
+
     if (action === 'approve') {
+       if (['approved', 'rejected'].includes(order.returnRequest.status)) {
+         return errorResponse(res, 400, `Return is already ${order.returnRequest.status}.`);
+       }
        order.returnRequest.status = 'approved';
-       order.statusHistory.push({ status: order.status, note: 'Return request approved by admin', updatedBy: req.user._id });
+       emailSubject = `\u{2705} Return Approved: Order #${order.orderNumber}`;
+       emailNote = 'Your return request has been approved. Please ship the items back to us within 7 days.';
+       order.statusHistory.push({ status: order.status, note: 'Return approved. Customer notified to ship items back.', updatedBy: req.user._id });
     } else if (action === 'reject') {
        order.returnRequest.status = 'rejected';
-       order.statusHistory.push({ status: order.status, note: 'Return request rejected by admin', updatedBy: req.user._id });
+       emailSubject = `\u{274C} Return Request Declined: Order #${order.orderNumber}`;
+       emailNote = 'We are sorry, your return request could not be approved at this time. Please contact support for assistance.';
+       order.statusHistory.push({ status: order.status, note: 'Return request rejected by admin.', updatedBy: req.user._id });
     } else if (action === 'receive_items') {
+       if (order.returnRequest.status !== 'approved') {
+         return errorResponse(res, 400, 'Return must be approved before marking items as received.');
+       }
        order.returnRequest.status = 'items_received';
-       order.statusHistory.push({ status: order.status, note: 'Returned items received by admin', updatedBy: req.user._id });
+       order.statusHistory.push({ status: order.status, note: 'Returned items received and inspected by warehouse.', updatedBy: req.user._id });
     } else if (action === 'issue_refund') {
+       if (order.returnRequest.status !== 'items_received') {
+         return errorResponse(res, 400, 'Items must be received before issuing a refund.');
+       }
        order.returnRequest.refundStatus = 'refunded';
        order.status = 'refunded';
        order.paymentStatus = 'refunded';
-       order.statusHistory.push({ status: 'refunded', note: 'Refund issued for returned order', updatedBy: req.user._id });
+       emailSubject = `\u{1F4B8} Refund Processed: Order #${order.orderNumber}`;
+       emailNote = `Your refund of \u20B9${order.totalAmount?.toFixed(2)} has been initiated and should reflect within 5-7 business days.`;
+       order.statusHistory.push({ status: 'refunded', note: 'Refund issued after successful return inspection. Order closed.', updatedBy: req.user._id });
     } else {
-       return errorResponse(res, 400, 'Invalid action');
+       return errorResponse(res, 400, 'Invalid action. Valid: approve, reject, receive_items, issue_refund');
     }
 
     await order.save();
-    return successResponse(res, 200, `Return request action '${action}' processed successfully`, { order });
+    await logActivity(req.user._id, 'Return Request Actioned', 'Order', order._id, `Return '${action}' on Order #${order.orderNumber}`, req.ip);
+
+    // Email customer
+    if (emailSubject && order.user?.email) {
+      try {
+        await sendEmail({
+          to: order.user.email,
+          subject: emailSubject,
+          html: `<div style="font-family:sans-serif;max-width:560px;padding:32px;background:#f9f9f9;border-radius:12px"><h2 style="margin-bottom:8px">${emailSubject}</h2><p style="color:#555">${emailNote}</p><p>Order Number: <strong>#${order.orderNumber}</strong></p><p style="color:#888;font-size:13px">If you have any questions, contact us at support@printicom.in</p></div>`
+        });
+      } catch (e) { console.error('[Email] Return notification error:', e.message); }
+    }
+
+    return successResponse(res, 200, `Return '${action}' processed successfully`, { order });
   } catch (error) {
     return errorResponse(res, 500, error.message);
   }
